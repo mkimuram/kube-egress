@@ -10,7 +10,7 @@ set -e
 
 # Parse Options
 NAME=$(basename $0 | tr - ' ')
-OPTS=$(getopt --options dhi:p:r:s:u:v: --longoptions delete,help,interface:,pod-subnet:,vip-routeid-mappings:,service-subnet:,update-interval:,podip-vip-mappings --name "$NAME" -- "$@")
+OPTS=$(getopt --options dhi:p:r:s:u:v: --longoptions delete,help,interface:,pod-subnet:,vip-routeid-mappings:,service-subnet:,update-interval:,podip-vip-mappings: --name "$NAME" -- "$@")
 [[ $? != 0 ]] && echo "Failed parsing options" >&2 && exit 1
 eval set -- "$OPTS"
 
@@ -43,15 +43,12 @@ Options:
 EOF
 }
 
+
 function reload_mappings() {
-  unset PODIP_VIP_MAPPINGS
-  declare -A PODIP_VIP_MAPPINGS
   while read config;do
     PODIP_VIP_MAPPINGS[$config]=$(cat ${PODIP_VIP_MAPPING_DIR}/$config)
   done <<< "$(ls ${PODIP_VIP_MAPPING_DIR})"
 
-  unset VIP_ROUTEID_MAPPINGS
-  declare -A VIP_ROUTEID_MAPPINGS
   while read config;do
     VIP_ROUTEID_MAPPINGS[$config]=$(cat ${VIP_ROUTEID_MAPPING_DIR}/$config)
   done <<< "$(ls ${VIP_ROUTEID_MAPPING_DIR})"
@@ -228,7 +225,13 @@ fi
 
 while [[ -n "${UPDATE_INTERVAL}" ]]; do
   sleep "${UPDATE_INTERVAL}"
+
+  unset PODIP_VIP_MAPPINGS
+  unset VIP_ROUTEID_MAPPINGS
+  declare -A PODIP_VIP_MAPPINGS
+  declare -A VIP_ROUTEID_MAPPINGS
   reload_mappings
+
   apply
 done
 
