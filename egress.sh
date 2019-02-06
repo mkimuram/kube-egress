@@ -43,14 +43,13 @@ Options:
 EOF
 }
 
-
 function reload_mappings() {
   while read config;do
-    PODIP_VIP_MAPPINGS[$config]=$(cat ${PODIP_VIP_MAPPING_DIR}/$config)
+    PODIP_VIP_MAPPINGS["${config}"]=$(cat "${PODIP_VIP_MAPPING_DIR}/${config}")
   done <<< "$(ls ${PODIP_VIP_MAPPING_DIR})"
 
   while read config;do
-    VIP_ROUTEID_MAPPINGS[$config]=$(cat ${VIP_ROUTEID_MAPPING_DIR}/$config)
+    VIP_ROUTEID_MAPPINGS["${config}"]=$(cat "${VIP_ROUTEID_MAPPING_DIR}/${config}")
   done <<< "$(ls ${VIP_ROUTEID_MAPPING_DIR})"
 }
 
@@ -60,113 +59,122 @@ function log() {
   echo "${timestamp} ${message}"
 }
 
-function add_iptables() {
-  log "Adding iptables rules"
+function handle_rule() {
+  local action=${1}
+  local table=${2}
+  local chain=${3}
+  shift 3
 
-  iptables -t mangle -N EGRESS
-  iptables -t mangle -A EGRESS -d "${POD_SUBNET}" -j RETURN
-  iptables -t mangle -A EGRESS -d "${SERVICE_SUBNET}" -j RETURN
+  #iptables -t ${table} -C ${chain} $@ 2>/dev/null
+  #if [ $? -eq 0 ];then
+  if (iptables -t ${table} -C ${chain} $@ 2>/dev/null);then
+    if [ ${action} == "-A" ] || [ ${action} == "-I" ] || [ ${action} == "-N" ];then
+      # Trying to add/insert existing rule or to create existing chain
+      return
+    fi
+  else
+    if [ ${action} == "-D" ];then
+      # Trying to delete non-existing rule
+       return
+    fi
+  fi
 
-  for POD_IP in "${!PODIP_VIP_MAPPINGS[@]}"; do
-    VIP="${PODIP_VIP_MAPPINGS[$POD_IP]}"
-    ROUTE_ID="${VIP_ROUTEID_MAPPINGS[$VIP]}"
-    iptables -t mangle -A EGRESS -s "${POD_IP}" -j MARK --set-mark "${ROUTE_ID}/${ROUTE_ID}"
-  done
-
-  iptables -t mangle -A PREROUTING -j EGRESS
-
-  for ROUTE_ID in "${VIP_ROUTEID_MAPPINGS[@]}"; do
-    iptables -t nat -I POSTROUTING -m mark --mark "${ROUTE_ID}/${ROUTE_ID}" -j RETURN
-  done
+  iptables -t ${table} ${action} ${chain} $@ 2>/dev/null || true
 }
 
-function add_egress() {
-  log "Adding iptables rules for egress"
+function add_egress_node_rule() {
+  local pod_ip=${1}
+  local interface=${2}
+  local route_id=${3}
+  local vip=${4}
 
-  for POD_IP in "${!PODIP_VIP_MAPPINGS[@]}"; do
-    VIP="${PODIP_VIP_MAPPINGS[$POD_IP]}"
-    if (ip -o addr show "${INTERFACE}" | grep -Fq "${VIP}"); then
-      log "VIP ${VIP} transitioned to primary"
-      log "Egress now enabled on node ${HOSTNAME}"
-    else
-      continue
-    fi
-    ROUTE_ID="${VIP_ROUTEID_MAPPINGS[$VIP]}"
-    iptables -t mangle -A FORWARD -s "${POD_IP}" -i "${INTERFACE}" -o "${INTERFACE}" -j MARK --set-mark "${ROUTE_ID}/${ROUTE_ID}"
-  done
-
-  for VIP in "${!VIP_ROUTEID_MAPPINGS[@]}"; do
-    if (ip -o addr show "${INTERFACE}" | grep -Fq "${VIP}"); then
-      ROUTE_ID="${VIP_ROUTEID_MAPPINGS[$VIP]}"
-      iptables -t nat -I POSTROUTING -o "${INTERFACE}" -m mark --mark "${ROUTE_ID}/${ROUTE_ID}" -j SNAT --to "${VIP}"
-    fi
-  done
+  handle_rule -A mangle FORWARD -s "${pod_ip}" -i "${interface}" -o "${interface}" -j MARK --set-mark "${route_id}/${route_id}"
+  handle_rule -I nat POSTROUTING -o "${interface}" -m mark --mark "${route_id}/${route_id}" -j SNAT --to "${vip}"
 }
 
-function add_routes() {
-  log "Adding routing rules"
+function del_egress_node_rule() {
+  local pod_ip=${1}
+  local interface=${2}
+  local route_id=${3}
+  local vip=${4}
 
-  for VIP in "${!VIP_ROUTEID_MAPPINGS[@]}"; do
-    if (ip -o addr show "${INTERFACE}" | grep -Fq "${VIP}"); then
-      continue
-    else
-      log "VIP ${VIP} transitioned to secondary"
-      log "Egress for ${VIP} now disabled on node ${HOSTNAME}"
-    fi
+  handle_rule -D mangle FORWARD -s "${pod_ip}" -i "${interface}" -o "${interface}" -j MARK --set-mark "${route_id}/${route_id}"
+  handle_rule -D nat POSTROUTING -o "${interface}" -m mark --mark "${route_id}/${route_id}" -j SNAT --to "${vip}"
+}
+
+function add_nonegress_node_rule() {
+  local route_id=${1}
+  local route_table=${2}
+  local vip=${3}
+  local interface=${4}
+
+  if ! (grep -q "${route_id} ${route_table}" "/etc/iproute2/rt_tables.d/${route_table}.conf");then
+    echo "${route_id} ${route_table}" > "/etc/iproute2/rt_tables.d/${route_table}.conf"
+  fi
+  ip route add default via "${vip}" dev "${interface}" table "${route_table}" 2>/dev/null || true
+  ip rule add fwmark "${route_id}/${route_id}" table "${route_table}"  2>/dev/null || true
+}
+
+function del_nonegress_node_rule() {
+  local route_table=${1}
+
+  ip rule del table "${route_table}" 2>/dev/null || true
+  ip route flush table "${route_table}" 2>/dev/null || true
+  rm -f "/etc/iproute2/rt_tables.d/${route_table}.conf"
+}
+
+function apply() {
+  log "Applying common iptables rules"
+  handle_rule -N mangle EGRESS
+  handle_rule -A mangle EGRESS -d "${POD_SUBNET}" -j RETURN
+  handle_rule -A mangle EGRESS -d "${SERVICE_SUBNET}" -j RETURN
+  handle_rule -A mangle PREROUTING -j EGRESS
+
+  log "Applying iptables rules for each egress ip and pod ip"
+  for POD_IP in "${!PODIP_VIP_MAPPINGS[@]}"; do
+    VIP="${PODIP_VIP_MAPPINGS[$POD_IP]}"
     ROUTE_ID="${VIP_ROUTEID_MAPPINGS[$VIP]}"
     ROUTE_TABLE="${ROUTE_TABLE_PREFIX}_${ROUTE_ID}"
-    echo "${ROUTE_ID} ${ROUTE_TABLE}" > "/etc/iproute2/rt_tables.d/${ROUTE_TABLE}.conf"
-    ip route add default via "${VIP}" dev "${INTERFACE}" table "${ROUTE_TABLE}"
-    ip rule add fwmark "${ROUTE_ID}/${ROUTE_ID}" table "${ROUTE_TABLE}"
+
+    handle_rule -A mangle EGRESS -s "${POD_IP}" -j MARK --set-mark "${ROUTE_ID}/${ROUTE_ID}"
+    handle_rule -A nat POSTROUTING -m mark --mark "${ROUTE_ID}/${ROUTE_ID}" -j RETURN
+
+    if (ip -o addr show "${INTERFACE}" | grep -Fq "${VIP}"); then
+      log "VIP ${VIP} transitioned to primary"
+      add_egress_node_rule ${POD_IP} ${INTERFACE} ${ROUTE_ID} ${VIP}
+      del_nonegress_node_rule ${ROUTE_TABLE}
+      log "Egress for ${VIP} now enabled on node ${HOSTNAME}"
+    else
+      log "VIP ${VIP} transitioned to secondary"
+      del_egress_node_rule ${POD_IP} ${INTERFACE} ${ROUTE_ID} ${VIP}
+      add_nonegress_node_rule ${ROUTE_ID} ${ROUTE_TABLE} ${VIP} ${INTERFACE}
+      log "Egress for ${VIP} now disabled on node ${HOSTNAME}"
+    fi
   done
 
   ip route flush cache
 }
 
 function delete() {
-  log "Deleting iptables rules"
-
-  for ROUTE_ID in "${VIP_ROUTEID_MAPPINGS[@]}"; do
-    iptables -t nat -D POSTROUTING -m mark --mark "${ROUTE_ID}/${ROUTE_ID}" -j RETURN 2>/dev/null || true
-  done
-
-  iptables -t mangle -D PREROUTING -j EGRESS 2>/dev/null || true
-
+  log "Deleting iptables rules for each egress ip and pod ip"
   for POD_IP in "${!PODIP_VIP_MAPPINGS[@]}"; do
     VIP="${PODIP_VIP_MAPPINGS[$POD_IP]}"
     ROUTE_ID="${VIP_ROUTEID_MAPPINGS[$VIP]}"
-    iptables -t mangle -D FORWARD -s "${POD_IP}" -i "${INTERFACE}" -o "${INTERFACE}" -j MARK --set-mark "${ROUTE_ID}/${ROUTE_ID}" 2>/dev/null || true
-  done
-
-  iptables -t mangle -F EGRESS 2>/dev/null || true
-  iptables -t mangle -X EGRESS 2>/dev/null || true
-
-  for VIP in "${!VIP_ROUTEID_MAPPINGS[@]}"; do
-    ROUTE_ID="${VIP_ROUTEID_MAPPINGS[$VIP]}"
-    iptables -t nat -D POSTROUTING -o "${INTERFACE}" -m mark --mark "${ROUTE_ID}/${ROUTE_ID}" -j SNAT --to "${VIP}" 2>/dev/null || true
-  done
-
-  log "Deleting routing rules"
-
-  for ROUTE_ID in "${VIP_ROUTEID_MAPPINGS[@]}"; do
     ROUTE_TABLE="${ROUTE_TABLE_PREFIX}_${ROUTE_ID}"
-    ip rule del table "${ROUTE_TABLE}" 2>/dev/null || true
-    ip route flush table "${ROUTE_TABLE}" 2>/dev/null || true
+
+    handle_rule -D mangle EGRESS -s "${POD_IP}" -j MARK --set-mark "${ROUTE_ID}/${ROUTE_ID}"
+    handle_rule -D nat POSTROUTING -m mark --mark "${ROUTE_ID}/${ROUTE_ID}" -j RETURN
+
+    del_nonegress_node_rule ${ROUTE_TABLE}
+    del_egress_node_rule ${POD_IP} ${INTERFACE} ${ROUTE_ID} ${VIP}
   done
 
   ip route flush cache
 
-  for ROUTE_ID in "${VIP_ROUTEID_MAPPINGS[@]}"; do
-    ROUTE_TABLE="${ROUTE_TABLE_PREFIX}_${ROUTE_ID}"
-    rm -f "/etc/iproute2/rt_tables.d/${ROUTE_TABLE}.conf"
-  done
-}
-
-function apply() {
-  delete
-  add_routes
-  add_iptables
-  add_egress
+  log "Deleting common iptables rules"
+  iptables -t mangle -F EGRESS 2>/dev/null || true
+  iptables -t mangle -X EGRESS 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -j EGRESS 2>/dev/null || true
 }
 
 while true
@@ -214,6 +222,8 @@ done
 # Verify interface exists
 ip addr show "${INTERFACE}" >/dev/null
 
+declare -A PODIP_VIP_MAPPINGS
+declare -A VIP_ROUTEID_MAPPINGS
 reload_mappings
 
 if [ $DELETE == true ];then
